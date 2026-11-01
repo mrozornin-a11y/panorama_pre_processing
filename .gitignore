@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# panorama_pre_processing
+*.json.tmp
+*.jpg.part

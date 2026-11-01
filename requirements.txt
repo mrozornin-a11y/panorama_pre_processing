@@ -1,0 +1,4 @@
+PySide6-Essentials>=6.8
+Pillow>=11.0
+numpy>=2.1
+opencv-python-headless>=4.10
