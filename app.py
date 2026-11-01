@@ -8,7 +8,7 @@ from collections import OrderedDict
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QObject, QPointF, QRectF, QRunnable, Qt, QThread, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QObject, QPoint, QPointF, QRectF, QRunnable, Qt, QThread, QThreadPool, QTimer, Signal
 from PySide6.QtGui import (QBrush, QColor, QFont, QIcon, QImage, QKeySequence, QPainter, QPainterPath, QPalette,
                            QPen, QPixmap, QShortcut, QTransform)
 from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog,
@@ -267,7 +267,7 @@ class PanoramaView(QGraphicsView):
         self.setScene(QGraphicsScene(self))
         self.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
-        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)  # привязка к курсору — вручную
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setBackgroundBrush(QColor(VIEW_BG))
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -277,8 +277,11 @@ class PanoramaView(QGraphicsView):
         self.viewport().setMouseTracking(True)
         self.horizontalScrollBar().valueChanged.connect(lambda *_: self.main.view_changed(self))
         self.verticalScrollBar().valueChanged.connect(lambda *_: self.main.view_changed(self))
-        self.side = None              # какой исходник показан (режим исходников) или None — результат
+        self.side = None              # исходник в отдельном окне (режим «Рядом» на исходниках) или None
+        self.frames = {}              # сторона → (A, B): координаты сцены = A·(пиксели исходника) + B
+        self.common = (1 + 0j, 0j)    # (A, B): координаты сцены = A·(общая система C) + B
         self.content = QRectF()
+        self._wheel_anchor = None
         self.layers, self.layer_keys = {}, {}
         self.markers = []
         self.crop_item = None
@@ -289,11 +292,14 @@ class PanoramaView(QGraphicsView):
         self._space = False
 
     # --- содержимое
-    def reset(self, rect, message, side=None):
+    def reset(self, rect, message, side=None, frames=None, common=(1 + 0j, 0j)):
         self.main.syncing += 1
         self.scene().clear()
         self.layers, self.layer_keys, self.markers, self.crop_item = {}, {}, [], None
         self.side = side
+        self.frames = frames or {}
+        self.common = common
+        self._wheel_anchor = None
         self.content = QRectF(rect)
         bg = self.scene().addRect(self.content, QPen(Qt.PenStyle.NoPen), QBrush(QColor("#2d323a")))
         bg.setZValue(-1e6)
@@ -303,7 +309,8 @@ class PanoramaView(QGraphicsView):
         text.setPos(self.content.center().x() - br.width() / 2, self.content.center().y() - br.height() / 2)
         text.setZValue(-1e6)
         self.placeholder = [bg, text]
-        m = max(self.content.width(), self.content.height())
+        # большой запас вокруг изображения: точка под курсором остаётся на месте при любом допустимом увеличении
+        m = 10 * max(self.content.width(), self.content.height())
         self.setSceneRect(self.content.adjusted(-m, -m, m, m))
         self.main.syncing -= 1
 
@@ -311,7 +318,8 @@ class PanoramaView(QGraphicsView):
         if len(self.placeholder) == 2:
             self.placeholder[1].setText(message)
 
-    def set_layer(self, side, arr, rect, key):
+    def set_layer(self, side, arr, tf, key):
+        """Слой side: пиксели arr → сцена преобразованием tf (QTransform)."""
         if self.layer_keys.get(side) == key:
             return
         old = self.layers.pop(side, None)
@@ -322,8 +330,7 @@ class PanoramaView(QGraphicsView):
             self.placeholder = self.placeholder[:1]
         item = self.scene().addPixmap(QPixmap.fromImage(to_qimage(arr)))
         item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
-        item.setPos(rect[0], rect[1])
-        item.setTransform(QTransform.fromScale(rect[2] / arr.shape[1], rect[3] / arr.shape[0]))
+        item.setTransform(tf)
         item.setZValue(-1e5 + (1 if side == "crossed" else 0))
         item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self.layers[side] = item
@@ -357,6 +364,35 @@ class PanoramaView(QGraphicsView):
     def center(self):
         return self.mapToScene(self.viewport().rect().center())
 
+    def scale_factor(self):
+        """Пикселей экрана на единицу сцены."""
+        t = self.transform()
+        return math.hypot(t.m11(), t.m12())
+
+    def fit_scale(self):
+        if self.content.isEmpty():
+            return 1.0
+        vp = self.viewport().rect()
+        return min(vp.width() / self.content.width(), vp.height() / self.content.height())
+
+    def zoom_at(self, p, factor):
+        """Увеличение в factor раз; точка сцены под экранной точкой p остаётся на месте."""
+        anchor = self.mapToScene(p)
+        if self._wheel_anchor and self._wheel_anchor[0] == p and \
+                (self._wheel_anchor[1] - anchor).manhattanLength() * self.scale_factor() <= 2:
+            anchor = self._wheel_anchor[1]   # серия шагов колеса: без накопления ошибок округления
+        self._wheel_anchor = (QPoint(p), QPointF(anchor))
+        self.main.syncing += 1
+        try:
+            self.scale(factor, factor)
+            q = self.mapFromScene(anchor)
+            hb, vb = self.horizontalScrollBar(), self.verticalScrollBar()
+            hb.setValue(hb.value() + q.x() - p.x())
+            vb.setValue(vb.value() + q.y() - p.y())
+        finally:
+            self.main.syncing -= 1
+        self.main.view_changed(self)
+
     # --- курсор и попадания
     def update_cursor(self, hit=None):
         if self._pan is not None:
@@ -384,7 +420,7 @@ class PanoramaView(QGraphicsView):
         r = self.main.crop_rect()
         if not r:
             return "new"
-        tol = 8 / max(1e-9, self.transform().m11())
+        tol = 8 / max(1e-9, self.scale_factor())
         x0, y0, x1, y1 = r[0], r[1], r[0] + r[2], r[1] + r[3]
         inside_y = y0 - tol <= p.y() <= y1 + tol
         inside_x = x0 - tol <= p.x() <= x1 + tol
@@ -405,14 +441,16 @@ class PanoramaView(QGraphicsView):
 
     # --- события
     def focusNextPrevChild(self, nxt):
-        return False  # Tab — переключение исправленных изображений
+        return False  # Tab — переключение параллельных / скрещённых николей
 
     def wheelEvent(self, e):
-        factor = 1.0015 ** e.angleDelta().y()
-        current = self.transform().m11()
-        if 0.0005 < current * factor < 40:
-            self.scale(factor, factor)
-            self.main.view_changed(self)
+        d = e.angleDelta().y() or e.pixelDelta().y()
+        if not d:
+            return
+        cur = self.scale_factor()
+        new = min(max(cur * 1.0015 ** d, 0.1 * self.fit_scale()), 40.0)
+        if abs(new / cur - 1) > 1e-9:
+            self.zoom_at(e.position().toPoint(), new / cur)
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.MiddleButton or (e.button() == Qt.MouseButton.LeftButton and self._space):
@@ -423,13 +461,18 @@ class PanoramaView(QGraphicsView):
             return
         p = self.mapToScene(e.position().toPoint())
         mode = self.main.mode()
-        if mode == "points" and self.side:
+        side = self.main.interaction_side(self)
+        if mode == "points" and side:
             m = self.marker_at(e.position())
             if m is not None:
-                self._drag = ("point", m, m.pos() - p)
+                self._drag = ("point", m, m.pos() - p, side)
                 self.main.select_point(m.index)
                 return
-            self._press = e.position()
+            self._press = (e.position(), side)
+            return
+        if mode == "points" and self.main.single():
+            self.main.statusBar().showMessage("В режиме наложения точки не ставятся — выберите «Переключение» "
+                                              "или «Рядом»", 4000)
             return
         if mode == "result":
             hit = self.crop_hit(p)
@@ -453,7 +496,7 @@ class PanoramaView(QGraphicsView):
             return
         if self.main.mode() == "result" and not self._space:
             self.update_cursor(self.crop_hit(p))
-        elif self.main.mode() == "points" and self.marker_at(e.position()) is not None:
+        elif self.main.interaction_side(self) and self.marker_at(e.position()) is not None:
             self.viewport().setCursor(Qt.CursorShape.SizeAllCursor)
         else:
             self.update_cursor()
@@ -467,9 +510,9 @@ class PanoramaView(QGraphicsView):
             return
         p = self.mapToScene(e.position().toPoint())
         if self._drag and self._drag[0] == "point":
-            item = self._drag[1]
+            item, side = self._drag[1], self._drag[3]
             self._drag = None
-            self.main.move_point(self.side, item.index, item.pos().x(), item.pos().y())
+            self.main.move_point(side, item.index, *self.main.scene_to_source(self, side, item.pos()))
             return
         if self._drag and self._drag[0] == "crop":
             _, hit, p0, start, v0 = self._drag
@@ -478,10 +521,9 @@ class PanoramaView(QGraphicsView):
             self.main.crop_end(start if click and hit == "new" else None)
             return
         if self._press is not None:
-            moved = (e.position() - self._press).manhattanLength()
-            self._press = None
-            if moved < 6 and self.side:
-                self.main.add_point(self.side, p.x(), p.y())
+            (v0, side), self._press = self._press, None
+            if (e.position() - v0).manhattanLength() < 6:
+                self.main.add_point(side, *self.main.scene_to_source(self, side, p))
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key.Key_Space and not e.isAutoRepeat():
@@ -644,6 +686,7 @@ class MainWindow(QMainWindow):
         self.show_sources = False    # «Показать исходники» для совмещённой пары
         self.view_mode = "pair"      # pair / overlay / switch
         self.switch_side = "parallel"
+        self.frame = None            # (α, β) общей системы для показа исходников в одном окне
         self.syncing = 0
         self.undo, self.redo = {}, {}
         self.crop_before = None
@@ -1003,38 +1046,115 @@ class MainWindow(QMainWindow):
         self.rebuild(fit=True)
 
     def rebuild(self, fit=False):
-        """Полная перестройка сцен (смена пары, режима или совмещения)."""
+        """Полная перестройка сцен (смена пары, режима или совмещения). Без fit положение и увеличение
+        просмотра сохраняются (пересчитываются через общую систему координат)."""
+        states = None if fit else self.capture_views()
         pair = self.pair()
         mode = self.mode()
         if mode == "none":
+            self.frame = None
             for v in self.views:
                 v.reset(QRectF(0, 0, 4000, 3000), "Нет шлифов" if self.project else "Создайте или откройте проект")
+            self.apply_layout()
             self.update_panel()
             return
+        sizes = self.sizes(pair)
+        self.frame = geometry.display_frame(pair["points"], sizes, pair["align"]) if all(sizes.values()) else None
         if mode == "result":
             canvas = pair["align"]["canvas"]
             for v in self.views:
                 v.reset(QRectF(*canvas), "Подготовка исправленного изображения…")
+        elif self.single():
+            frames = self.source_frames()
+            pts = [A * complex(x, y) + B for side, (A, B) in frames.items()
+                   for x, y in ((0, 0), (sizes[side][0], 0), (0, sizes[side][1]), sizes[side])]
+            x0, x1 = min(p.real for p in pts), max(p.real for p in pts)
+            y0, y1 = min(p.imag for p in pts), max(p.imag for p in pts)
+            rect = QRectF(x0, y0, x1 - x0, y1 - y0)
+            self.views[0].reset(rect, "Загрузка…", frames=frames)
+            self.views[1].reset(rect, "")
         else:
             for v, side in zip(self.views, core.SIDES):
                 path = self.project.image_path(pair, side)
-                size = core.image_size(path)
+                size = sizes[side]
                 if not pair[side]:
                     msg = "Изображение не назначено"
                 elif not os.path.isfile(path):
                     msg = f"Файл не найден:\n{pair[side]}"
                 elif size is None:
-                    msg = f"Не удалось прочитать файл:\n{pair[side]}"
+                    msg = "Не удалось прочитать файл:\n" + pair[side]
                 else:
                     msg = "Загрузка…"
-                v.reset(QRectF(0, 0, *(size or (4000, 3000))), msg, side if size else None)
+                v.reset(QRectF(0, 0, *(size or (4000, 3000))), msg, side if size else None,
+                        frames={side: (1 + 0j, 0j)} if size else None, common=self.common_for(side))
         self.request_layers()
         self.apply_layout()
         self.update_markers()
         self.update_crop()
         self.update_panel()
-        if fit:
+        if fit or not any(states):
             QTimer.singleShot(0, self.fit_views)
+        else:
+            QTimer.singleShot(0, lambda: self.restore_views(states))
+
+    def single(self):
+        """Одно окно (наложение или переключение) — для результата и для исходников."""
+        if self.view_mode == "pair":
+            return False
+        mode = self.mode()
+        return mode == "result" or (mode == "points" and self.frame is not None)
+
+    def source_frames(self):
+        """Исходники в общей системе (только общее подобие, без локальной деформации)."""
+        a, b = self.frame
+        return {"parallel": (1 / a, -b / a), "crossed": (a, b)}
+
+    def common_for(self, side):
+        """(A, B): пиксели исходника side = A·C + B."""
+        if self.frame is None:
+            return (1 + 0j, 0j)
+        a, b = self.frame
+        return (a, b) if side == "parallel" else (1 / a, -b / a)
+
+    def scene_to_source(self, view, side, p):
+        A, B = view.frames.get(side, (1 + 0j, 0j))
+        z = (complex(p.x(), p.y()) - B) / A
+        return z.real, z.imag
+
+    def interaction_side(self, view):
+        """На каком исходнике щелчки в этом окне ставят и двигают точки (None — нигде)."""
+        if self.mode() != "points":
+            return None
+        if self.single():
+            return self.switch_side if self.view_mode == "switch" and view.index == 0 else None
+        return view.side
+
+    def capture_views(self):
+        """Положение и увеличение видимых окон в общей системе координат."""
+        out = []
+        for v in self.views:
+            if not v.isVisible() or v.content.isEmpty():
+                out.append(None)
+                continue
+            A, B = v.common
+            c = v.center()
+            out.append(((complex(c.x(), c.y()) - B) / A, v.scale_factor() * abs(A)))
+        return out
+
+    def restore_views(self, states):
+        first = next((st for st in states if st), None)
+        if first is None:
+            self.fit_views()
+            return
+        self.syncing += 1
+        for v, st in zip(self.views, states):
+            c, k = st or first
+            A, B = v.common
+            z = A * c + B
+            v.setTransform(QTransform.fromScale(k / abs(A), k / abs(A)))
+            v.centerOn(QPointF(z.real, z.imag))
+        self.syncing -= 1
+        self.view_changed(self.views[0])
 
     def layer_keys(self):
         """Нужные изображения: {сторона: (ключ кэша, задача, ключ исходника)}. Исправленный предпросмотр
@@ -1065,7 +1185,7 @@ class MainWindow(QMainWindow):
             elif key in self.errors or (dep and dep in self.errors):
                 err = self.errors.get(key) or self.errors.get(dep)
                 for v in self.views:
-                    if v.side in (side, None):
+                    if side in v.frames or not v.frames:
                         v.set_message(f"Не удалось подготовить изображение:\n{err}")
             elif dep and dep not in self.cache:
                 self.tasks.submit(dep, task_load_source(dep[4:]))
@@ -1077,12 +1197,18 @@ class MainWindow(QMainWindow):
 
     def _show_layer(self, side, key):
         item = self.cache[key]
+        arr = item["arr"]
+        h, w = arr.shape[:2]
         if self.mode() == "result":
+            x, y, cw, ch = item["rect"]
             for v in self.views:
-                v.set_layer(side, item["arr"], item["rect"], key)
-        else:
-            v = self.views[core.SIDES.index(side)]
-            v.set_layer(side, item["arr"], [0, 0, *item["size"]], key)
+                v.set_layer(side, arr, QTransform(cw / w, 0, 0, ch / h, x, y), key)
+            return
+        base = QTransform.fromScale(item["size"][0] / w, item["size"][1] / h)  # предпросмотр → пиксели исходника
+        for v in self.views:
+            if side in v.frames:
+                A, B = v.frames[side]
+                v.set_layer(side, arr, base * QTransform(A.real, A.imag, -A.imag, A.real, B.real, B.imag), key)
 
     def _task_done(self, key, result, err):
         if key.startswith("align|"):
@@ -1099,26 +1225,32 @@ class MainWindow(QMainWindow):
 
     def apply_layout(self):
         result = self.mode() == "result"
-        single = result and self.view_mode != "pair"
+        single = self.single()
         self.view_cards[1].setVisible(not single)
         pair = self.pair()
+        nxt = self.next_point() if pair and not result and self.adding else None
+        state = "исправлено" if result else "исходное"
         for i, title in enumerate(self.view_titles):
             target = False
-            if not pair:
+            if not pair or (single and i == 1):
                 text = ""
-            elif not result:
+            elif single and self.view_mode == "overlay":
+                text = "Наложение: скрещённые поверх параллельных" + \
+                    ("" if result else " — исходные (общий сдвиг, поворот и масштаб по точкам)")
+            elif single:
+                side = self.switch_side
+                text = f"{core.SIDE_TITLES[side]} — {state} (Tab — переключить)"
+                if nxt and nxt[1] == side:
+                    text = f"▶ {core.SIDE_TITLES[side]} — поставьте точку {nxt[0] + 1} (Tab — переключить)"
+                    target = True
+                elif nxt and nxt[1]:
+                    text += f" · точка {nxt[0] + 1} ставится на {geometry.SIDE_GEN[nxt[1]]}"
+            else:
                 side = core.SIDES[i]
-                text = f"{core.SIDE_TITLES[side]} — исходное"
-                nxt = self.next_point()
-                if self.adding and nxt and nxt[1] == side:
+                text = f"{core.SIDE_TITLES[side]} — {state}"
+                if nxt and nxt[1] == side:
                     text = f"▶ {core.SIDE_TITLES[side]} — поставьте точку {nxt[0] + 1}"
                     target = True
-            elif self.view_mode == "pair":
-                text = f"{core.SIDE_TITLES[core.SIDES[i]]} — исправлено"
-            elif self.view_mode == "overlay":
-                text = "Наложение: скрещённые поверх параллельных"
-            else:
-                text = f"{core.SIDE_TITLES[self.switch_side]} — исправлено (Tab — переключить)"
             title.setText(text)
             if title.property("target") != target:
                 title.setProperty("target", target)
@@ -1129,33 +1261,41 @@ class MainWindow(QMainWindow):
     def apply_layers(self):
         k = self.opacity.value() / 100
         self.opacity_label.setText(f"Прозрачность {self.opacity.value()} %")
-        if self.mode() != "result":
-            for v in self.views:
-                v.set_layer_state({v.side: True} if v.side else {}, {})
-            return
-        if self.view_mode == "pair":
-            self.views[0].set_layer_state({"parallel": True}, {})
-            self.views[1].set_layer_state({"crossed": True}, {})
+        if not self.single():
+            if self.mode() == "result":
+                self.views[0].set_layer_state({"parallel": True}, {})
+                self.views[1].set_layer_state({"crossed": True}, {})
+            else:
+                for v in self.views:
+                    v.set_layer_state({s: True for s in v.frames}, {})
         elif self.view_mode == "overlay":
             self.views[0].set_layer_state({"parallel": True, "crossed": True}, {"crossed": 1 - k})
         else:
             self.views[0].set_layer_state({self.switch_side: True}, {})
 
     def set_view_mode(self, mode):
+        if mode == self.view_mode:
+            return
         self.view_mode = mode
+        if self.mode() == "points":
+            self.rebuild()  # исходники: одно окно в общей системе или два окна в пикселях исходников
+            return
         self.apply_layout()
         self.update_panel()
         if mode == "pair":
             QTimer.singleShot(0, lambda: self.view_changed(self.views[0]))
 
     def toggle_switch(self):
-        if self.mode() != "result":
+        """Tab: чередование параллельных и скрещённых в одном окне (результат или исходники);
+        увеличение и положение сохраняются, точки и совмещение не меняются."""
+        if self.mode() == "none":
             return
         if self.view_mode != "switch":
             self.mode_radios["switch"].setChecked(True)
             return
         self.switch_side = core.other_side(self.switch_side)
         self.apply_layout()
+        self.update_markers()
 
     def fit_views(self):
         pair = self.pair()
@@ -1210,7 +1350,7 @@ class MainWindow(QMainWindow):
         self.adding = self.btn_add.isChecked()
         if self.adding and self.mode() == "result":
             self.show_sources = True
-            self.rebuild(fit=True)
+            self.rebuild()
             return
         self.apply_layout()
         self.update_markers()
@@ -1291,18 +1431,29 @@ class MainWindow(QMainWindow):
                 v.set_markers(specs)
             return
         pts = pair["points"]
-        for v, side in zip(self.views, core.SIDES):
+        single = self.single()
+        for v in self.views:
+            if single:
+                sides = [] if v.index else (core.SIDES if self.view_mode == "overlay" else [self.switch_side])
+            else:
+                sides = list(v.frames)
             specs = []
-            for i, pt in enumerate(pts):
-                if pt[side]:
-                    specs.append((str(i + 1), *pt[side], "selected" if i == self.sel_point else "normal", i))
-            if self.sel_point is not None and self.sel_point < len(pts):
-                pt = pts[self.sel_point]
-                other = core.other_side(side)
-                if not pt[side] and pt[other]:
-                    guess = geometry.predict_point(pts, other, pt[other])
-                    if guess:
-                        specs.append(("?", *guess, "ghost", self.sel_point))
+            for side in sides:
+                A, B = v.frames[side]
+
+                def at(xy):
+                    z = A * complex(*xy) + B
+                    return z.real, z.imag
+                for i, pt in enumerate(pts):
+                    if pt[side]:
+                        specs.append((str(i + 1), *at(pt[side]), "selected" if i == self.sel_point else "normal", i))
+                if self.sel_point is not None and self.sel_point < len(pts):
+                    pt = pts[self.sel_point]
+                    other = core.other_side(side)
+                    if not pt[side] and pt[other]:
+                        guess = geometry.predict_point(pts, other, pt[other])
+                        if guess:
+                            specs.append(("?", *at(guess), "ghost", self.sel_point))
             v.set_markers(specs)
 
     # --- совмещение
@@ -1354,7 +1505,7 @@ class MainWindow(QMainWindow):
             self.adding = False
             if first:
                 self.sync_cb.setChecked(True)
-            self.rebuild(fit=True)
+            self.rebuild()
         if params["warnings"]:
             QMessageBox.information(self, "Усреднение геометрии", "\n\n".join(params["warnings"]))
 
@@ -1362,7 +1513,7 @@ class MainWindow(QMainWindow):
         self.show_sources = self.btn_sources.isChecked()
         if not self.show_sources:
             self.adding = False
-        self.rebuild(fit=True)
+        self.rebuild()
 
     def reset_alignment(self):
         pair = self.pair()
@@ -1375,7 +1526,7 @@ class MainWindow(QMainWindow):
         self._refresh_pair_item(self.cur)
         self.show_sources = False
         self.changed()
-        self.rebuild(fit=True)
+        self.rebuild()
 
     # --- обрезка
     def crop_rect(self):
@@ -1562,9 +1713,9 @@ class MainWindow(QMainWindow):
 
         result = mode == "result"
         for rb in self.mode_radios.values():
-            rb.setEnabled(result)
-        self.opacity.setEnabled(result and self.view_mode == "overlay")
-        self.btn_switch.setEnabled(result)
+            rb.setEnabled(pair is not None)
+        self.opacity.setEnabled(pair is not None and self.view_mode == "overlay")
+        self.btn_switch.setEnabled(pair is not None)
         self.sync_cb.setEnabled(result and self.view_mode == "pair")
         self.common_cb.setEnabled(result)
         self.btn_apply_crop.setEnabled(result and bool(pair.get("crop_draft")) and

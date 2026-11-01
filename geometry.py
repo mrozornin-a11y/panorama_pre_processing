@@ -480,6 +480,27 @@ def common_points(params):
     return out
 
 
+def display_frame(points, sizes, params=None):
+    """(α, β) общей системы C для показа исходников в одном окне без локальной деформации:
+    параллельные C = (P − β)/α, скрещённые C = α·Q + β. После совмещения — сохранённые параметры
+    (тот же кадр, что у результата); иначе — по уже поставленным точкам; без точек — по размерам кадров."""
+    if params:
+        return complex(*params["alpha"]), complex(*params["beta"])
+    full = complete_points(points)
+    if len(full) >= 2:
+        P = np.array([complex(*p) for _, p, _ in full])
+        Q = np.array([complex(*q) for _, _, q in full])
+        try:
+            a, b = fit_similarity(P, Q)
+            if MIN_SCALE <= abs(a) <= MAX_SCALE:
+                return half_similarity(a, b)
+        except AlignError:
+            pass
+    (wp, hp), (wc, hc) = sizes["parallel"], sizes["crossed"]
+    a = complex(math.sqrt(wp * hp / (wc * hc)), 0)
+    return half_similarity(a, complex(wp / 2, hp / 2) - a * complex(wc / 2, hc / 2))
+
+
 def predict_point(points, side, xy):
     """Ожидаемое положение на втором изображении для точки xy на side (по уже поставленным парам):
     аффинно при ≥3 невырожденных точках, по подобию при 2, иначе None."""
