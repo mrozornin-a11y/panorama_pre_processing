@@ -34,8 +34,14 @@ class Harness:
     def __init__(self, workdir):
         self.qa = QApplication.instance() or QApplication(sys.argv)
         A.apply_style(self.qa)
-        for name in ("warning", "information"):
-            setattr(QMessageBox, name, staticmethod(lambda *a, **k: QMessageBox.StandardButton.Ok))
+        self.messages = []
+        for name in ("warning", "information", "question"):
+            def fake(*a, _n=name, **k):
+                self.messages.append((_n, a[2] if len(a) > 2 else ""))
+                return QMessageBox.StandardButton.Yes
+            setattr(QMessageBox, name, staticmethod(fake))
+        QMessageBox.exec = lambda box: self.messages.append(("box", box.text(), box.detailedText())) or 0
+        self.workdir = workdir
         img_dir = os.path.join(workdir, "фото")
         os.makedirs(img_dir)
         st = T.make_structure()
@@ -221,6 +227,33 @@ def run(workdir):
     w.mode_radios["pair"].setChecked(True)
     h.wait()
     ok(v1.isVisible() and v0.side == "parallel" and v1.side == "crossed", "«Рядом» на исходниках: два окна")
+
+    # --- экспорт: все файлы сразу в выбранную папку, в исходном формате
+    out = os.path.join(h.workdir, "результат")
+    os.makedirs(out)
+    A.QFileDialog.getExistingDirectory = staticmethod(lambda *a, **k: out)
+
+    def export_now():
+        w.export(False)
+        t = time.time()
+        while w.worker is not None and time.time() - t < 120:
+            h.pump(0.05)
+        h.pump()
+    ok(w.format_combo.currentData() == "source", "по умолчанию — исходный формат")
+    export_now()
+    ok(sorted(os.listdir(out)) == ["5. Ш-1 с.jpg", "5. Ш-1.jpg"], f"экспорт без подпапок: {sorted(os.listdir(out))}")
+    n = len(h.messages)
+    export_now()
+    ok(any(m[0] == "question" and "Заменить" in m[1] for m in h.messages[n:]), "повторный экспорт спрашивает о замене")
+    # ошибка: имя файла занято папкой → понятное сообщение, подробности и журнал рядом с проектом
+    shutil.rmtree(out)
+    os.makedirs(os.path.join(out, "5. Ш-1.jpg"))
+    n = len(h.messages)
+    export_now()
+    box = [m for m in h.messages[n:] if m[0] == "box"]
+    log = os.path.join(h.workdir, "ошибки экспорта.txt")
+    ok(box and "запись 5. Ш-1.jpg" in box[0][1] and "Traceback" in box[0][2] and os.path.isfile(log),
+       "ошибка экспорта: шаг и файл в сообщении, подробности и журнал «ошибки экспорта.txt»")
     w.close()
     h.pump()
 

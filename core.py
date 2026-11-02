@@ -18,7 +18,8 @@ SIDE_SHORT = {"parallel": "Параллельные", "crossed": "Скрещён
 
 IMAGE_EXT = {".png", ".jpg", ".jpeg"}
 JPEG_MAX_SIDE = 65500
-DEFAULT_SETTINGS = {"jpeg_quality": 95}
+DEFAULT_SETTINGS = {"jpeg_quality": 95, "export_format": "source"}
+EXPORT_FORMATS = {"source": "Исходный", "jpeg": "JPEG"}
 
 
 # ---------------------------------------------------------------- пары файлов (правила panorama_marking)
@@ -296,32 +297,66 @@ def safe_filename(name):
     return name or "шлиф"
 
 
-def export_names(pair):
-    """Имена файлов результата: исходные базовые имена (.jpg). Если файлы назначены вручную и их имена
-    не образуют пару по правилам panorama_marking — «<название>.jpg» и «<название> с.jpg»."""
+def export_names(pair, fmt="source"):
+    """Имена файлов результата — исходные базовые имена. fmt="source": расширение исходного файла
+    (PNG остаётся PNG, JPEG — JPEG), "jpeg": «.jpg». Если файлы назначены вручную и их имена не образуют пару
+    по правилам panorama_marking — «<название>» и «<название> с»."""
+    def ext(side):
+        e = os.path.splitext(pair[side])[1]
+        return e if fmt == "source" and e.lower() in IMAGE_EXT else ".jpg"
+
     names = {s: split_name(pair[s]) for s in SIDES}
     if not names["parallel"][1] and names["crossed"][1] and names["parallel"][0] == names["crossed"][0]:
-        stems = {s: unicodedata.normalize("NFC", os.path.splitext(pair[s])[0]).strip() for s in SIDES}
-        out = {s: safe_filename(stems[s]) + ".jpg" for s in SIDES}
-        if split_name(out["crossed"])[1] and not split_name(out["parallel"])[1]:
-            return out
+        stems = {s: safe_filename(unicodedata.normalize("NFC", os.path.splitext(pair[s])[0]).strip()) for s in SIDES}
+        if split_name(stems["crossed"])[1] and not split_name(stems["parallel"])[1]:
+            return {s: stems[s] + ext(s) for s in SIDES}
     base = safe_filename(pair["name"])
-    return {"parallel": base + ".jpg", "crossed": base + " с.jpg"}
+    return {"parallel": base + ext("parallel"), "crossed": base + " с" + ext("crossed")}
 
 
-def save_jpeg(img, path, quality):
-    if max(img.size) > JPEG_MAX_SIDE:
-        raise ValueError(f"размер {img.width}×{img.height} превышает предел формата JPEG ({JPEG_MAX_SIDE} px)")
-    q = int(quality)
+class ExportError(Exception):
+    """Ошибка экспорта с указанием шага (чтение / расчёт / запись)."""
+
+
+def save_image(img, path, quality, icc=None):
+    """Запись по расширению path: PNG — без потерь, JPEG — с заданным качеством. Сначала во временный файл."""
     tmp = path + ".part"
-    img.save(tmp, "JPEG", quality=q, subsampling=0 if q >= 90 else 2,
-             optimize=img.width * img.height <= 60_000_000)
-    os.replace(tmp, path)
+    extra = {"icc_profile": icc} if icc else {}
+    if os.path.splitext(path)[1].lower() == ".png":
+        img.save(tmp, "PNG", compress_level=4, **extra)
+    else:
+        if max(img.size) > JPEG_MAX_SIDE:
+            raise ValueError(f"размер {img.width}×{img.height} превышает предел формата JPEG ({JPEG_MAX_SIDE} px) — "
+                             "сохраните в PNG или уменьшите рамку")
+        q = int(quality)
+        img.save(tmp, "JPEG", quality=q, subsampling=0 if q >= 90 else 2,
+                 optimize=img.width * img.height <= 60_000_000, **extra)
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
-def export_pair(pair, image_dir, out_root, quality, progress=None, cancelled=None):
-    """Экспорт пары: подпапка с названием пары и два JPEG. Преобразование и обрезка — одно
-    пересэмплирование из оригиналов, блоками. Возвращает папку или None при отмене."""
+def icc_profile(path):
+    try:
+        with Image.open(path) as im:
+            return im.info.get("icc_profile")
+    except (OSError, ValueError):
+        return None
+
+
+def export_targets(pair, out_dir, fmt="source"):
+    """Полные пути файлов результата пары: {сторона: путь}."""
+    return {s: os.path.join(out_dir, n) for s, n in export_names(pair, fmt).items()}
+
+
+def export_pair(pair, image_dir, out_dir, quality, fmt="source", progress=None, cancelled=None):
+    """Экспорт пары: два файла сразу в out_dir (исходные базовые имена). Преобразование и обрезка — одно
+    пересэмплирование из оригиналов, блоками. Возвращает список записанных файлов или None при отмене."""
     if not pair.get("align"):
         raise ValueError("пара не совмещена — нажмите «Усреднить геометрию»")
     for side in SIDES:
@@ -336,32 +371,49 @@ def export_pair(pair, image_dir, out_root, quality, progress=None, cancelled=Non
             raise ValueError(f"размер файла {pair[side]} изменился после совмещения — повторите усреднение")
     field = geometry.get_field(params)
     rect = output_rect(pair)
-    folder = os.path.join(out_root, safe_filename(pair["name"]))
-    os.makedirs(folder, exist_ok=True)
-    names = export_names(pair)
+    os.makedirs(out_dir, exist_ok=True)
+    targets = export_targets(pair, out_dir, fmt)
+    written = []
     for n, side in enumerate(SIDES):
         if cancelled and cancelled():
             return None
-        src = load_full(os.path.join(image_dir, pair[side]))
-        size = src.size
-        out = Image.new("RGB", (rect[2], rect[3]))
+        path = os.path.join(image_dir, pair[side])
+        stage = f"чтение {pair[side]}"
+        try:
+            icc = icc_profile(path)
+            src = load_full(path)
+            size = src.size
+            stage = f"расчёт {os.path.basename(targets[side])}"
+            out = Image.new("RGB", (rect[2], rect[3]))
 
-        def sink(tile, x, y, out=out):
-            out.paste(Image.fromarray(tile), (x, y))
+            def sink(tile, x, y, out=out):
+                out.paste(Image.fromarray(tile), (x, y))
 
-        def prog(i, total, n=n):
-            if progress:
-                progress((n + i / total * 0.9) / 2)
+            def prog(i, total, n=n):
+                if progress:
+                    progress((n + i / total * 0.9) / 2)
 
-        done = field.render(side, src, size, rect, sink=sink, block=2048, progress=prog, cancelled=cancelled)
-        del src
-        if done is None and cancelled and cancelled():
-            return None
-        save_jpeg(out, os.path.join(folder, names[side]), quality)
-        del out
+            done = field.render(side, src, size, rect, sink=sink, block=2048, progress=prog, cancelled=cancelled)
+            del src
+            if done is None and cancelled and cancelled():
+                return None
+            stage = f"запись {os.path.basename(targets[side])}"
+            save_image(out, targets[side], quality, icc)
+            del out
+        except ExportError:
+            raise
+        except MemoryError:
+            raise ExportError(f"недостаточно памяти ({stage}, результат {rect[2]}×{rect[3]} px) — закройте другие "
+                              "программы или уменьшите рамку") from None
+        except PermissionError as e:
+            raise ExportError(f"нет доступа к файлу ({stage}) — возможно, он открыт в другой программе "
+                              f"или папка защищена: {e}") from e
+        except Exception as e:  # noqa: BLE001 — добавить к любой ошибке, на каком шаге она случилась
+            raise ExportError(f"{stage}: {type(e).__name__}: {e}") from e
+        written.append(targets[side])
         if progress:
             progress((n + 1) / 2)
-    return folder
+    return written
 
 
 def clone(obj):

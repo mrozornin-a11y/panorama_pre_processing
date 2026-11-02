@@ -4,10 +4,13 @@ import copy
 import math
 import os
 import sys
+import time
+import traceback
 from collections import OrderedDict
 
 import cv2
 import numpy as np
+from PIL import Image
 from PySide6.QtCore import QObject, QPoint, QPointF, QRectF, QRunnable, Qt, QThread, QThreadPool, QTimer, Signal
 from PySide6.QtGui import (QBrush, QColor, QFont, QIcon, QImage, QKeySequence, QPainter, QPainterPath, QPalette,
                            QPen, QPixmap, QShortcut, QTransform)
@@ -648,30 +651,31 @@ def row(*widgets):
 
 class ExportWorker(QThread):
     progress = Signal(float, int, str)
-    report = Signal(list, int, bool)
+    report = Signal(list, int, bool, str)
 
-    def __init__(self, pairs, image_dir, out_dir, quality):
+    def __init__(self, pairs, image_dir, out_dir, quality, fmt):
         super().__init__()
-        self.pairs, self.image_dir, self.out_dir, self.quality = pairs, image_dir, out_dir, quality
+        self.pairs, self.image_dir, self.out_dir = pairs, image_dir, out_dir
+        self.quality, self.fmt = quality, fmt
         self.cancelled = False
 
     def run(self):
-        errors, done = [], 0
+        errors, details, done = [], [], 0
         for i, pair in enumerate(self.pairs):
             if self.cancelled:
                 break
             self.progress.emit(float(i), i, pair["name"])
             try:
-                res = core.export_pair(pair, self.image_dir, self.out_dir, self.quality,
+                res = core.export_pair(pair, self.image_dir, self.out_dir, self.quality, self.fmt,
                                        progress=lambda f, i=i: self.progress.emit(i + f, i, pair["name"]),
                                        cancelled=lambda: self.cancelled)
                 if res:
                     done += 1
-            except MemoryError:
-                errors.append(f"{pair['name']}: недостаточно памяти для экспорта")
             except Exception as e:  # noqa: BLE001 — ошибка одной пары не прерывает пакет
                 errors.append(f"{pair['name']}: {e}")
-        self.report.emit(errors, done, self.cancelled)
+                details.append(f"=== {pair['name']}\nПараллельные: {pair['parallel']}\nСкрещённые: {pair['crossed']}\n"
+                               + "".join(traceback.format_exception(e)))
+        self.report.emit(errors, done, self.cancelled, "\n".join(details))
 
 
 # ---------------------------------------------------------------- главное окно
@@ -716,7 +720,15 @@ class MainWindow(QMainWindow):
         spacer = QWidget()
         spacer.setSizePolicy(spacer.sizePolicy().Policy.Expanding, spacer.sizePolicy().Policy.Preferred)
         tb.addWidget(spacer)
-        tb.addWidget(QLabel("Качество JPEG "))
+        tb.addWidget(QLabel("Формат "))
+        self.format_combo = QComboBox()
+        for key, text in core.EXPORT_FORMATS.items():
+            self.format_combo.addItem(text, key)
+        self.format_combo.setToolTip("Исходный: PNG сохраняется в PNG (без потерь), JPEG — в JPEG с исходным "
+                                     "расширением. «Всё в JPEG» — оба файла .jpg")
+        self.format_combo.activated.connect(self._format_changed)
+        tb.addWidget(self.format_combo)
+        tb.addWidget(QLabel("  Качество JPEG "))
         self.quality_spin = QSpinBox()
         self.quality_spin.setRange(50, 100)
         self.quality_spin.setValue(core.DEFAULT_SETTINGS["jpeg_quality"])
@@ -984,6 +996,8 @@ class MainWindow(QMainWindow):
         self.quality_spin.blockSignals(True)
         self.quality_spin.setValue(int(project.settings["jpeg_quality"]))
         self.quality_spin.blockSignals(False)
+        idx = self.format_combo.findData(project.settings.get("export_format", "source"))
+        self.format_combo.setCurrentIndex(max(0, idx))
         self.pair_list.blockSignals(True)
         self.pair_list.clear()
         for _ in project.pairs:
@@ -1020,6 +1034,11 @@ class MainWindow(QMainWindow):
 
     def changed(self):
         self.save_timer.start()
+
+    def _format_changed(self, *_):
+        if self.project:
+            self.project.settings["export_format"] = self.format_combo.currentData()
+            self.changed()
 
     def _quality_changed(self, v):
         if self.project:
@@ -1894,10 +1913,32 @@ class MainWindow(QMainWindow):
         if os.path.normcase(os.path.abspath(out)) == os.path.normcase(os.path.abspath(self.project.image_dir)):
             QMessageBox.warning(self, "Экспорт", "Выберите папку, отличную от папки с исходными фотографиями.")
             return
+        fmt = self.project.settings.get("export_format", "source")
+        # все файлы — сразу в выбранную папку: проверить совпадения имён и уже существующие файлы
+        owner, clash = {}, []
+        for p in pairs:
+            if not (p["parallel"] and p["crossed"]):
+                continue
+            for path in core.export_targets(p, out, fmt).values():
+                key = os.path.normcase(path)
+                if key in owner and owner[key] is not p:
+                    clash.append(f"{os.path.basename(path)}: «{owner[key]['name']}» и «{p['name']}»")
+                owner.setdefault(key, p)
+        if clash:
+            QMessageBox.warning(self, "Экспорт", "Разные пары дают файлы с одинаковыми именами — исправьте назначение "
+                                "файлов (кнопка «Назначить файлы…»):\n" + "\n".join(clash[:20]))
+            return
+        existing = [os.path.basename(k) for k in owner if os.path.exists(k)]
+        if existing:
+            lines = "\n".join(existing[:15]) + (f"\n… и ещё {len(existing) - 15}" if len(existing) > 15 else "")
+            ans = QMessageBox.question(self, "Экспорт", f"В папке уже есть файлы с такими именами ({len(existing)}):\n"
+                                       f"{lines}\n\nЗаменить их?")
+            if ans != QMessageBox.StandardButton.Yes:
+                return
         self.last_export_dir = out
         self.save_project()
         self.worker = ExportWorker(copy.deepcopy(pairs), self.project.image_dir, out,
-                                   int(self.project.settings["jpeg_quality"]))
+                                   int(self.project.settings["jpeg_quality"]), fmt)
         self.progress = QProgressDialog("Экспорт…", "Отмена", 0, 1000 * len(pairs), self)
         self.progress.setWindowTitle("Экспорт")
         self.progress.setWindowModality(Qt.WindowModality.NonModal)
@@ -1906,7 +1947,7 @@ class MainWindow(QMainWindow):
         self.progress.setAutoReset(False)
         self.progress.canceled.connect(self._cancel_export)
         self.worker.progress.connect(self._export_progress)
-        self.worker.report.connect(lambda e, d, c: self._export_done(e, d, c, len(pairs), out))
+        self.worker.report.connect(lambda e, d, c, det: self._export_done(e, d, c, det, len(pairs), out))
         self.update_panel()
         self.progress.show()
         self.worker.start()
@@ -1921,18 +1962,39 @@ class MainWindow(QMainWindow):
             self.progress.setValue(int(value * 1000))
             self.progress.setLabelText(f"Экспорт {i + 1} из {self.progress.maximum() // 1000}: {name}")
 
-    def _export_done(self, errors, done, cancelled, total, out):
+    def _export_done(self, errors, done, cancelled, details, total, out):
         self.worker.wait()
         self.worker = None
         self.progress.close()
         self.update_panel()
         text = f"{'Экспорт прерван' if cancelled else 'Экспорт завершён'}.\n" \
                f"Экспортировано пар: {done} из {total}.\nПапка: {out}"
-        if errors:
-            lines = "\n".join(errors[:20]) + (f"\n… и ещё {len(errors) - 20}" if len(errors) > 20 else "")
-            QMessageBox.warning(self, "Экспорт", f"{text}\n\nОшибки ({len(errors)}):\n{lines}")
-        else:
+        if not errors:
             QMessageBox.information(self, "Экспорт", text)
+            return
+        log = self.write_error_log(errors, details, out)
+        lines = "\n".join(errors[:20]) + (f"\n… и ещё {len(errors) - 20}" if len(errors) > 20 else "")
+        box = QMessageBox(QMessageBox.Icon.Warning, "Экспорт",
+                          f"{text}\n\nОшибки ({len(errors)}):\n{lines}" +
+                          (f"\n\nПодробности сохранены в файл:\n{log}" if log else ""), parent=self)
+        box.setDetailedText(details)
+        box.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        box.exec()
+
+    def write_error_log(self, errors, details, out):
+        """Журнал ошибок экспорта рядом с файлом проекта (дописывается)."""
+        if not self.project:
+            return None
+        path = os.path.join(os.path.dirname(self.project.path), "ошибки экспорта.txt")
+        try:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(f"\n##### {time.strftime('%Y-%m-%d %H:%M:%S')} — экспорт в {out}\n")
+                fh.write(f"Python {sys.version.split()[0]}, Pillow {Image.__version__}, numpy {np.__version__}, "
+                         f"OpenCV {cv2.__version__}\n")
+                fh.write("\n".join(errors) + "\n\n" + details + "\n")
+            return path
+        except OSError:
+            return None
 
     def closeEvent(self, e):
         if self.worker:

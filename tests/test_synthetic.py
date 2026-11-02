@@ -235,14 +235,33 @@ def run(workdir):
     pair["done"] = True
     hashes = {s: file_hash(os.path.join(img_dir, pair[s])) for s in core.SIDES}
     out_dir = os.path.join(workdir, "экспорт")
-    folder = core.export_pair(pair, img_dir, out_dir, 95)
+    folder = out_dir
+    written = core.export_pair(pair, img_dir, out_dir, 95)   # по умолчанию — исходный формат
     names = core.export_names(pair)
-    ok(names == {"parallel": "16. Г-170.jpg", "crossed": "16. Г-170 с.jpg"},
-       f"имена результата — исходные базовые: {names['parallel']}, {names['crossed']}")
+    ok(names == {"parallel": "16. Г-170.jpg", "crossed": "16. Г-170 с.png"},
+       f"исходный формат и базовые имена: {names['parallel']}, {names['crossed']}")
+    ok(sorted(os.listdir(out_dir)) == sorted(names.values()) and
+       sorted(written) == sorted(os.path.join(out_dir, n) for n in names.values()),
+       "файлы записаны сразу в выбранную папку, без подпапок")
+    ok(Image.open(os.path.join(out_dir, names["crossed"])).format == "PNG" and
+       Image.open(os.path.join(out_dir, names["parallel"])).format == "JPEG", "PNG сохранён в PNG, JPEG — в JPEG")
     outs = {s: np.asarray(Image.open(os.path.join(folder, names[s])).convert("RGB")) for s in core.SIDES}
     ok(outs["parallel"].shape == outs["crossed"].shape == (pair["crop"][3], pair["crop"][2], 3),
        f"общая обрезка: оба файла {outs['parallel'].shape[1]}×{outs['parallel'].shape[0]} px")
-    ok(os.path.basename(folder) == "16. Г-170", "подпапка названа по паре")
+    direct = field.render("crossed", np.asarray(Image.open(os.path.join(img_dir, pair["crossed"])).convert("RGB")),
+                          SIZES["crossed"], pair["crop"], block=2048)
+    ok(np.array_equal(direct, outs["crossed"]), "PNG-результат без потерь: совпадает с расчётом побитово")
+    out_jpg = os.path.join(workdir, "экспорт_jpeg")
+    core.export_pair(pair, img_dir, out_jpg, 95, fmt="jpeg")
+    ok(sorted(os.listdir(out_jpg)) == ["16. Г-170 с.jpg", "16. Г-170.jpg"], "режим «Всё в JPEG»: оба файла .jpg")
+    bad_dir = os.path.join(workdir, "экспорт_ошибка")
+    os.makedirs(os.path.join(bad_dir, names["parallel"]))  # имя занято папкой — запись невозможна
+    try:
+        core.export_pair(pair, img_dir, bad_dir, 95)
+        ok(False, "ошибка записи должна сообщаться")
+    except core.ExportError as e:
+        ok(str(e).startswith("запись 16. Г-170.jpg"), f"ошибка экспорта указывает шаг и файл: {str(e)[:60]}…")
+    ok(not [f for f in os.listdir(bad_dir) if f.endswith(".part")], "после ошибки временные файлы удалены")
     ok(all(file_hash(os.path.join(img_dir, pair[s])) == hashes[s] for s in core.SIDES), "исходные файлы не изменены")
 
     # 3. экспорт = предпросмотр (предпросмотр строится из уменьшенных копий, как в программе)
@@ -281,7 +300,8 @@ def run(workdir):
     ok(np.array_equal(f2.ux, field.ux) and np.array_equal(f2.uy, field.uy),
        "поле деформации после открытия совпадает побитово")
     out2 = os.path.join(workdir, "экспорт2")
-    folder2 = core.export_pair(lp, loaded.image_dir, out2, 95)
+    core.export_pair(lp, loaded.image_dir, out2, 95)
+    folder2 = out2
     same = all(np.array_equal(np.asarray(Image.open(os.path.join(folder2, names[s]))), outs[s]) for s in core.SIDES)
     ok(same, "экспорт после повторного открытия проекта идентичен")
 
